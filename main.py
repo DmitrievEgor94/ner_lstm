@@ -274,6 +274,6 @@ if __name__ == '__main__':
     test_samples, test_targets = sentence_ids_padded[test_inds], tags_targets[test_inds]
 
     res_df, loss_value = get_metrics_on_set(model, test_samples, test_targets)
-    print(loss_value)
-    print(res_df.loc['accuracy'].iloc[0])
+    print(res_df)
+    # print(res_df.loc['accuracy'].iloc[0])
 

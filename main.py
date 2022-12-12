@@ -1,18 +1,20 @@
-import os.path
-
-import pandas as pd
-import numpy as np
-import torch
-import random
-from torch.nn import CrossEntropyLoss
-from torch.optim import Adam, SGD
-from torch.nn.utils.rnn import pad_sequence
-import pickle
 import json
+import os.path
+import pickle
+import random
+import time
+
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.metrics import classification_report, log_loss
 from torch import nn
+from torch.nn import CrossEntropyLoss
+from torch.nn.utils.rnn import pad_sequence
+from torch.optim import Adam
+from tqdm import tqdm
 
 from net import NerLSTM
-
 
 FOLDER_DATA = 'data'
 
@@ -22,7 +24,8 @@ def set_seeds(random_state=1):
     torch.manual_seed(random_state)
     random.seed(random_state)
 
-def prepare_dataset():
+
+def prepare_data():
     df = pd.read_csv(f'{FOLDER_DATA}/ner_datasetreference.csv', encoding='latin1')
     df = df.fillna(method='ffill')
     df.columns = ['sentence', 'word', 'pos', 'tag']
@@ -56,7 +59,7 @@ def prepare_dataset():
         json.dump(tag2ind, file)
 
     tags_targets = [torch.tensor([tag2ind[tag] for tag in sentence], dtype=torch.int64)
-                 for sentence in sentences_tags]
+                    for sentence in sentences_tags]
 
     with open(f'{FOLDER_DATA}/tag2ind_dict.txt', 'w') as file:
         file.write(str(tag2ind))
@@ -85,9 +88,134 @@ def get_data():
         sentence_ids_padded = pickle.load(open(f'{FOLDER_DATA}/sentence_padded_data.pickle', 'rb'))
         tags_targets = pickle.load(open(f'{FOLDER_DATA}/sentence_padded_target.pickle', 'rb'))
     else:
-        sentences, word_dict, sentence_ids_padded, tag2ind, tags_targets = prepare_dataset()
+        sentences, word_dict, sentence_ids_padded, tag2ind, tags_targets = prepare_data()
 
     return sentences, word_dict, sentence_ids_padded, tag2ind, tags_targets
+
+
+def get_metrics_on_set(model: nn.Module, samples: torch.Tensor, targets: torch.Tensor, batch_size=50):
+    predicts_classes_all = []
+    predicts_probs_all = []
+    targets_all = []
+
+    for i in tqdm(range(0, samples.size()[0] - batch_size, batch_size)):
+        res = model(samples[i:i + batch_size])
+        res_classes = res.argmax(axis=-1)
+
+        for j in range(batch_size):
+            inds = targets[i + j] != -1
+
+            predicts_probs_all.extend(res[j, inds].detach().numpy())
+            predicts_classes_all.extend(res_classes[j, inds])
+            targets_all.extend(targets[i + j, inds].detach().numpy())
+
+    return pd.DataFrame(classification_report(targets_all, predicts_classes_all, output_dict=True)).T, \
+           log_loss(y_true=targets_all, y_pred=predicts_probs_all)
+
+
+def get_losses_epoch(sentence_ids_padded, tags_targets, weights):
+    model = NerLSTM(len(word_dict) + 1, 64, 64, len(tag2ind))
+
+    optimizer = Adam(model.parameters())
+    loss_func = CrossEntropyLoss(ignore_index=-1, weight=weights, reduction='mean')
+
+    batch_size = 40
+    epoch_number = 15
+
+    test_samples, test_targets = sentence_ids_padded[test_inds], tags_targets[test_inds]
+    results = []
+
+    for j in range(epoch_number):
+        for i in tqdm(range(0, sentence_ids_padded[train_inds].shape[0] - batch_size, batch_size)):
+            train_samples, train_targets = sentence_ids_padded[train_inds][i:i + 10], tags_targets[train_inds][i:i + 10]
+
+            res = model(train_samples)
+
+            loss = loss_func(res.view(-1, len(tag2ind)), train_targets.view(-1))
+
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+        res_df, loss_value = get_metrics_on_set(model, test_samples, test_targets)
+        results.append((j, loss_value, res_df.loc['accuracy'].iloc[0]))
+
+    pd.DataFrame(results, columns=['epoch number', 'log loss', 'accuracy'])\
+        .to_excel('epoch_loss_data.xlsx', index=False)
+
+
+def get_losses_lstm_hidden_dim(sentence_ids_padded, tags_targets, weights):
+    batch_size = 40
+    epoch_number = 10
+
+    test_samples, test_targets = sentence_ids_padded[test_inds], tags_targets[test_inds]
+    results = []
+
+    hidden_dims = [16, 32, 64, 100, 128]
+
+    for dim in hidden_dims:
+        set_seeds(47)
+        print(dim)
+        model = NerLSTM(len(word_dict) + 1, 64, dim, len(tag2ind))
+        optimizer = Adam(model.parameters())
+
+        loss_func = CrossEntropyLoss(ignore_index=-1, weight=weights, reduction='mean')
+
+        for j in range(epoch_number):
+            for i in tqdm(range(0, sentence_ids_padded[train_inds].shape[0] - batch_size, batch_size)):
+                train_samples, train_targets = sentence_ids_padded[train_inds][i:i + 10], tags_targets[train_inds][i:i + 10]
+
+                res = model(train_samples)
+
+                loss = loss_func(res.view(-1, len(tag2ind)), train_targets.view(-1))
+
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+
+        res_df, loss_value = get_metrics_on_set(model, test_samples, test_targets)
+        print(res_df)
+        results.append((dim, loss_value, res_df.loc['accuracy'].iloc[0]))
+
+    pd.DataFrame(results, columns=['neurons number', 'log loss', 'accuracy']).to_excel('hidden_dim_loss_data.xlsx',
+                                                                                       index=False)
+
+
+def get_losses_lstm_learning_rate(sentence_ids_padded, tags_targets, weights):
+    batch_size = 40
+    epoch_number = 10
+
+    test_samples, test_targets = sentence_ids_padded[test_inds], tags_targets[test_inds]
+    results = []
+
+    learning_rates = [0.0001, 0.001, 0.01, 0.05, 0.1]
+
+    for lr in learning_rates:
+        set_seeds(47)
+        print(lr)
+        model = NerLSTM(len(word_dict) + 1, 64, 64, len(tag2ind))
+        optimizer = Adam(model.parameters(), lr=lr)
+
+        loss_func = CrossEntropyLoss(ignore_index=-1, weight=weights, reduction='mean')
+
+        for j in range(epoch_number):
+            for i in tqdm(range(0, sentence_ids_padded[train_inds].shape[0] - batch_size, batch_size)):
+                train_samples, train_targets = sentence_ids_padded[train_inds][i:i + 10], tags_targets[train_inds][i:i + 10]
+
+                res = model(train_samples)
+
+                loss = loss_func(res.view(-1, len(tag2ind)), train_targets.view(-1))
+
+                loss.backward()
+                optimizer.step()
+                optimizer.zero_grad()
+
+        res_df, loss_value = get_metrics_on_set(model, test_samples, test_targets)
+        print(res_df)
+        results.append((lr, loss_value, res_df.loc['accuracy'].iloc[0]))
+
+    pd.DataFrame(results, columns=['learning rate', 'log loss', 'accuracy']).to_excel('learning_rate_loss_data.xlsx',
+                                                                                       index=False)
 
 
 if __name__ == '__main__':
@@ -95,54 +223,57 @@ if __name__ == '__main__':
 
     sentences, word_dict, sentence_ids_padded, tag2ind, tags_targets = get_data()
 
-    # print(tags_targets.size())
-    # # # получениe номеров предложений для обучающей и тестовой выборки
-    # inds = np.arange(0, len(sentences), 1).tolist()
-    # num_train, num_test = int(len(sentences) * 0.8), len(sentences) - int(len(sentences) * 0.8)
-    #
-    # train_inds = random.sample(inds, k=num_train)
-    # test_inds = [ind for ind in inds if ind not in train_inds]
+    if os.path.exists('test_inds.pickle'):
+        train_inds = pickle.load(open('train_inds.pickle', 'rb'))
+        test_inds = pickle.load(open('test_inds.pickle', 'rb'))
+    else:
+        print(tags_targets.size())
+        # # получениe номеров предложений для обучающей и тестовой выборки
+        inds = np.arange(0, len(sentences), 1).tolist()
+        num_train, num_test = int(len(sentences) * 0.8), len(sentences) - int(len(sentences) * 0.8)
 
+        train_inds = random.sample(inds, k=num_train)
+        test_inds = [ind for ind in inds if ind not in train_inds]
+
+        pickle.dump(train_inds, open('train_inds.pickle', 'wb'))
+        pickle.dump(test_inds, open('test_inds.pickle', 'wb'))
+
+    print(len(train_inds), len(test_inds))
     model = NerLSTM(len(word_dict) + 1, 64, 64, len(tag2ind))
 
-    def init_weights(m):
-        if isinstance(m, nn.Linear):
-            torch.nn.init.xavier_uniform(m.weight)
-            m.bias.data.fill_(0.01)
+    target_count = pd.Series(tags_targets.flatten()).value_counts()
+    target_count.drop(index=-1, inplace=True)
+    target_count.sort_index(inplace=True)
 
+    weights = torch.tensor(target_count.values) / target_count.sum()
+    weights = 1. / weights
 
-    model.apply(init_weights)
+    # get_losses_epoch(sentence_ids_padded, tags_targets, weights)
+    # get_losses_lstm_hidden_dim(sentence_ids_padded, tags_targets, weights)
+    # get_losses_lstm_learning_rate(sentence_ids_padded, tags_targets, weights)
 
-    take_samples = 40
-    targets_test = tags_targets[:take_samples].contiguous()
-
-    print(pd.Series(targets_test[0]).value_counts())
     optimizer = Adam(model.parameters())
-    loss_func = CrossEntropyLoss(ignore_index=-1)
 
-    tokens_take = 13
+    loss_func = CrossEntropyLoss(ignore_index=-1, weight=weights, reduction='mean')
 
-    for i in range(500):
-        res = model(sentence_ids_padded[:take_samples, :tokens_take].contiguous())
-        a = res[0, 6]
-        # print(res.size())
-        # print(targets_test[:, :tokens_take].size())
-        loss = loss_func(res.view(-1, len(tag2ind)), targets_test[:, :tokens_take].contiguous().view(-1))
-        print(loss)
+    BATCH_SIZE = 40
+    EPOCH_NUMBER = 11
 
-        loss.backward()
+    for _ in range(0):
+        for i in tqdm(range(0, sentence_ids_padded[train_inds].shape[0] - BATCH_SIZE, BATCH_SIZE)):
+            train_samples, train_targets = sentence_ids_padded[train_inds][i:i + 10], tags_targets[train_inds][i:i + 10]
 
-        nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_norm=0.1,
-            norm_type=2,
-        )
+            res = model(train_samples)
 
-        optimizer.step()
-        optimizer.zero_grad()
+            loss = loss_func(res.view(-1, len(tag2ind)), train_targets.view(-1))
 
-    print(res.size())
-    print(res.argmax(axis=-1))
-    print(targets_test[:, :tokens_take])
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
 
+    test_samples, test_targets = sentence_ids_padded[test_inds], tags_targets[test_inds]
+
+    res_df, loss_value = get_metrics_on_set(model, test_samples, test_targets)
+    print(loss_value)
+    print(res_df.loc['accuracy'].iloc[0])
 

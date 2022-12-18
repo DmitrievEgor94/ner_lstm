@@ -8,16 +8,12 @@ class NerLSTM(nn.Module):
 
         self.embedding_layer = nn.Embedding(vocab_size, embedding_dim)
         self.bi_lstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True, bidirectional=True)
-        self.linear_layer = nn.Linear(2*hidden_dim, 64)
-        self.last_layer = nn.Linear(64, tags_dim)
+        self.last_layer = nn.Linear(2*hidden_dim, tags_dim)
 
     def forward(self, x):
         x = self.embedding_layer(x)
 
         x, _ = self.bi_lstm(x)
-
-        x = self.linear_layer(x)
-        x = F.relu(x)
 
         x = self.last_layer(x)
         out = F.softmax(x, dim=-1)

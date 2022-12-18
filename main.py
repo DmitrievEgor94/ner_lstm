@@ -2,7 +2,6 @@ import json
 import os.path
 import pickle
 import random
-import time
 
 import numpy as np
 import pandas as pd
@@ -11,7 +10,7 @@ from sklearn.metrics import classification_report, log_loss
 from torch import nn
 from torch.nn import CrossEntropyLoss
 from torch.nn.utils.rnn import pad_sequence
-from torch.optim import Adam
+from torch.optim import Adam, Adagrad, RMSprop
 from tqdm import tqdm
 
 from net import NerLSTM
@@ -140,7 +139,7 @@ def get_losses_epoch(sentence_ids_padded, tags_targets, weights):
         res_df, loss_value = get_metrics_on_set(model, test_samples, test_targets)
         results.append((j, loss_value, res_df.loc['accuracy'].iloc[0]))
 
-    pd.DataFrame(results, columns=['epoch number', 'log loss', 'accuracy'])\
+    pd.DataFrame(results, columns=['epoch number', 'log loss', 'accuracy']) \
         .to_excel('epoch_loss_data.xlsx', index=False)
 
 
@@ -163,7 +162,8 @@ def get_losses_lstm_hidden_dim(sentence_ids_padded, tags_targets, weights):
 
         for j in range(epoch_number):
             for i in tqdm(range(0, sentence_ids_padded[train_inds].shape[0] - batch_size, batch_size)):
-                train_samples, train_targets = sentence_ids_padded[train_inds][i:i + 10], tags_targets[train_inds][i:i + 10]
+                train_samples, train_targets = sentence_ids_padded[train_inds][i:i + 10], tags_targets[train_inds][
+                                                                                          i:i + 10]
 
                 res = model(train_samples)
 
@@ -200,7 +200,8 @@ def get_losses_lstm_learning_rate(sentence_ids_padded, tags_targets, weights):
 
         for j in range(epoch_number):
             for i in tqdm(range(0, sentence_ids_padded[train_inds].shape[0] - batch_size, batch_size)):
-                train_samples, train_targets = sentence_ids_padded[train_inds][i:i + 10], tags_targets[train_inds][i:i + 10]
+                train_samples, train_targets = sentence_ids_padded[train_inds][i:i + 10], tags_targets[train_inds][
+                                                                                          i:i + 10]
 
                 res = model(train_samples)
 
@@ -215,7 +216,7 @@ def get_losses_lstm_learning_rate(sentence_ids_padded, tags_targets, weights):
         results.append((lr, loss_value, res_df.loc['accuracy'].iloc[0]))
 
     pd.DataFrame(results, columns=['learning rate', 'log loss', 'accuracy']).to_excel('learning_rate_loss_data.xlsx',
-                                                                                       index=False)
+                                                                                      index=False)
 
 
 if __name__ == '__main__':
@@ -239,6 +240,7 @@ if __name__ == '__main__':
         pickle.dump(test_inds, open('test_inds.pickle', 'wb'))
 
     print(len(train_inds), len(test_inds))
+
     model = NerLSTM(len(word_dict) + 1, 64, 64, len(tag2ind))
 
     target_count = pd.Series(tags_targets.flatten()).value_counts()
@@ -252,28 +254,63 @@ if __name__ == '__main__':
     # get_losses_lstm_hidden_dim(sentence_ids_padded, tags_targets, weights)
     # get_losses_lstm_learning_rate(sentence_ids_padded, tags_targets, weights)
 
-    optimizer = Adam(model.parameters())
-
     loss_func = CrossEntropyLoss(ignore_index=-1, weight=weights, reduction='mean')
 
-    BATCH_SIZE = 40
-    EPOCH_NUMBER = 11
-
-    for _ in range(0):
-        for i in tqdm(range(0, sentence_ids_padded[train_inds].shape[0] - BATCH_SIZE, BATCH_SIZE)):
-            train_samples, train_targets = sentence_ids_padded[train_inds][i:i + 10], tags_targets[train_inds][i:i + 10]
-
-            res = model(train_samples)
-
-            loss = loss_func(res.view(-1, len(tag2ind)), train_targets.view(-1))
-
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+    BATCH_SIZE = 80
+    EPOCH_NUMBER = 35
 
     test_samples, test_targets = sentence_ids_padded[test_inds], tags_targets[test_inds]
 
-    res_df, loss_value = get_metrics_on_set(model, test_samples, test_targets)
-    print(res_df)
-    # print(res_df.loc['accuracy'].iloc[0])
+    optimizer = Adam(model.parameters())
 
+    optimizers_dict = {'Adam': Adam, 'Adagrad': Adagrad, 'RMSprop': RMSprop}
+    results = []
+
+    for optimizer_name in optimizers_dict:
+        optimizer_const = optimizers_dict[optimizer_name]
+
+        results.append([])
+        results[-1].append(optimizer_name)
+
+        for lm in [0, 0.001]:
+            print(lm)
+            set_seeds(47)
+
+            model = NerLSTM(len(word_dict) + 1, 64, 64, len(tag2ind))
+            optimizer = optimizer_const(model.parameters())
+
+            for j in range(EPOCH_NUMBER):
+                print('Epoch:', j)
+                for i in tqdm(range(0, sentence_ids_padded[train_inds].shape[0] - BATCH_SIZE, BATCH_SIZE)):
+                    train_samples, train_targets = sentence_ids_padded[train_inds][i:i + 10], tags_targets[train_inds][i:i + 10]
+
+                    res = model(train_samples)
+
+                    weights, bias = model.last_layer.parameters()
+
+                    loss = loss_func(res.view(-1, len(tag2ind)), train_targets.view(-1)) + lm * ((weights ** 2).sum() +
+                                                                                                 (bias ** 2).sum())
+
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+            res_df, loss = get_metrics_on_set(model, sentence_ids_padded[train_inds], tags_targets[train_inds])
+            results[-1].append(res_df.loc['accuracy'].iloc[0])
+            results[-1].append(res_df.loc['macro avg'].iloc[0])
+            results[-1].append(loss)
+
+            res_df, loss = get_metrics_on_set(model, test_samples, test_targets)
+            results[-1].append(res_df.loc['accuracy'].iloc[0])
+            results[-1].append(res_df.loc['macro avg'].iloc[0])
+            results[-1].append(loss)
+
+    print(results)
+    df_result = pd.DataFrame(results, columns=['optimizer', 'accuracy_without_train',
+                                   'macro_f1_without_train', 'loss_without_train',
+                                   'accuracy_without_test', 'macro_f1_without_test', 'loss_without_test',
+                                   'accuracy_with_train',
+                                   'macro_f1_with_train', 'loss_with_train',
+                                   'accuracy_with_test', 'macro_f1_with_test', 'loss_with_test'])
+    print(df_result)
+    df_result.to_excel('optimizer_data.xlsx', index=False)
